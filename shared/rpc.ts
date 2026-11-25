@@ -36,10 +36,10 @@ export const existsRpc = defineRpc({
 });
 
 // Uploads are chunked (256 KiB client-side) into a staging file next to the destination:
-// "<name>.filedrop-part", or "<name>.filedrop-part-<token>" where token is the first 8 hex
-// chars of uploadId so concurrent uploads of the same name don't interleave. When
-// bytesWritten reaches totalSize the staging file is renamed onto the destination, so a
-// failed upload never leaves a truncated file under the final name.
+// "<name>.filedrop-part-<token>" where token is the first 8 hex chars of uploadId so
+// concurrent uploads of the same name don't interleave. When bytesWritten reaches
+// totalSize the staging file is published onto the destination, so a failed upload never
+// leaves a truncated file under the final name.
 export const uploadChunkRpc = defineRpc({
   name: "filedrop.upload",
   input: z.object({
@@ -55,8 +55,9 @@ export const uploadChunkRpc = defineRpc({
     // with a FILEDROP_EXISTS error.
     overwrite: z.boolean().optional(),
     // Crypto-random per upload job (client sends a UUID); first 8 hex chars suffix the
-    // staging name. Optional; without it the shared ".filedrop-part" name is used.
-    uploadId: z.string().max(64).optional(),
+    // staging name and the whole id keys the daemon's staging-ownership registry, so it
+    // must be present and unique per upload job.
+    uploadId: z.string().min(1).max(64),
   }),
   output: z.object({
     path: z.string(),
