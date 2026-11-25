@@ -3,7 +3,6 @@ import {
   constants,
   fstatSync,
   lstatSync,
-  mkdirSync,
   openSync,
   realpathSync,
   renameSync,
@@ -13,7 +12,7 @@ import {
 import path from "node:path";
 import type { RpcInput } from "@getpaseo/plugin";
 import { FILEDROP_EXISTS, type uploadChunkRpc } from "../shared/rpc";
-import { isInside, resolveTargetDir, sanitizeRelativePath } from "./paths";
+import { ensureDirWithin, isInside, resolveTargetDir, sanitizeRelativePath } from "./paths";
 
 const MAX_CHUNK_BYTES = 8 * 1024 * 1024;
 const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
@@ -24,7 +23,9 @@ const PART_SUFFIX = ".filedrop-part";
 // O_NOFOLLOW makes the opens below fail on a staging path swapped to a symlink between
 // lstat and open (ELOOP), closing the leaf-component TOCTOU window.
 const NOFOLLOW = constants.O_NOFOLLOW || 0;
-const OPEN_CREATE = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | NOFOLLOW;
+// Fresh staging is created EXCLUSIVELY ("wx"): a pre-existing file at the staging path
+// errors on EEXIST — it is never truncated. Resuming opens r+ after ownership checks.
+const OPEN_EXCLUSIVE = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | NOFOLLOW;
 const OPEN_APPEND = constants.O_RDWR | NOFOLLOW;
 
 function lstatOrNull(filePath: string): Stats | null {
@@ -65,13 +66,9 @@ export function uploadChunk(input: RpcInput<typeof uploadChunkRpc>) {
     throw new Error("Resolved path escapes the target directory");
   }
   const parentDir = path.dirname(filePath);
-  mkdirSync(parentDir, { recursive: true });
-  // Re-verify after mkdir: path components may have resolved through symlinks during
-  // creation, so the canonical parent must still sit inside the resolved target dir.
-  const realParent = realpathSync(parentDir);
-  if (!isInside(realParent, directory)) {
-    throw new Error("Resolved path escapes the target directory");
-  }
+  // Create parents component-by-component under the canonical target: a symlink in a
+  // dropped folder tree is rejected before any mkdir can follow it out of the root.
+  ensureDirWithin(directory, parentDir);
 
   // lstat (not stat): a symlinked destination must never be written through or renamed
   // over silently. Residual TOCTOU: the leaf could be swapped between this check and the
@@ -101,16 +98,27 @@ export function uploadChunk(input: RpcInput<typeof uploadChunkRpc>) {
     throw new Error(`Staging path is not a regular file: ${part}`);
   }
 
-  // offset 0 opens with "w" (truncate/create); later chunks require "r+" and must land
-  // exactly at the current staging end — a gap or overlap means a stale or interleaved
-  // upload, which we reject.
-  const fd = openSync(part, offset === 0 ? OPEN_CREATE : OPEN_APPEND);
+  // An existing staging file may be resumed only when it belongs to this upload: the
+  // uploadId-derived token is embedded in its name, and its size must equal the chunk
+  // offset. Anything else at that path — including an uploadId-less shared name — is
+  // foreign and errors out; it is never truncated.
+  if (partStat) {
+    if (uploadId === undefined) {
+      throw new Error(`Staging file already exists and is not owned by this upload: ${part}`);
+    }
+    if (partStat.size !== offset) {
+      throw new Error(`Unexpected chunk offset ${offset}; staged file is ${partStat.size} bytes`);
+    }
+  } else if (offset !== 0) {
+    throw new Error(`No staged upload for offset ${offset}: ${part}`);
+  }
+
+  const fd = openSync(part, partStat ? OPEN_APPEND : OPEN_EXCLUSIVE);
   try {
-    if (offset > 0) {
-      const size = fstatSync(fd).size;
-      if (offset !== size) {
-        throw new Error(`Unexpected chunk offset ${offset}; staged file is ${size} bytes`);
-      }
+    // fstat is the authoritative size gate: the staging file could change between the
+    // lstat above and this open (same-name interleave), so recheck after opening.
+    if (fstatSync(fd).size !== offset) {
+      throw new Error(`Unexpected chunk offset ${offset}; staged file changed size`);
     }
     writeSync(fd, data, 0, data.length, offset);
   } finally {

@@ -1,4 +1,4 @@
-import { mkdirSync, realpathSync } from "node:fs";
+import { lstatSync, mkdirSync, realpathSync, type Stats } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -49,6 +49,51 @@ function outsideRootsError(roots: string[]): Error {
   );
 }
 
+// Creates `dir` (or verifies it exists) one component at a time below `anchor`, an
+// already-canonical allowed root. Every existing component must be a real directory —
+// never a symlink — and a missing component is created only after its parent chain is
+// verified, so no mkdir can follow a symlink out of the root: an escape is rejected
+// before anything outside the roots is created.
+export function ensureDirWithin(anchor: string, dir: string): string {
+  const relative = path.relative(anchor, dir);
+  if (relative === "" || relative === ".") return anchor;
+  if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error("Path escapes the allowed root");
+  }
+  let cursor = anchor;
+  for (const segment of relative.split(path.sep)) {
+    const next = path.join(cursor, segment);
+    let stat: Stats | null = null;
+    try {
+      stat = lstatSync(next);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    if (stat === null) {
+      try {
+        mkdirSync(next);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      stat = lstatSync(next);
+    }
+    if (stat.isSymbolicLink()) {
+      throw new Error(`Path component is a symbolic link: ${next}`);
+    }
+    if (!stat.isDirectory()) {
+      throw new Error(`Path component is not a directory: ${next}`);
+    }
+    // Progressive canonical verify: a component swapped to a symlink between lstat
+    // and this point resolves here, so deeper segments are never touched.
+    const real = realpathSync(next);
+    if (!isInside(real, anchor)) {
+      throw new Error(`Path component resolves outside the allowed root: ${next}`);
+    }
+    cursor = real;
+  }
+  return cursor;
+}
+
 // Resolves a user-supplied directory to a canonical path inside an allowed root.
 // `create` performs the documented `mkdir -p` for upload targets; browsing never creates.
 export function resolveTargetDir(input: string, options: { create: boolean }): string {
@@ -69,11 +114,32 @@ export function resolveTargetDir(input: string, options: { create: boolean }): s
     configuredRoots().some((root) => isInside(lexical, root));
   if (!inside) throw outsideRootsError(roots);
 
-  if (options.create) mkdirSync(lexical, { recursive: true });
+  if (options.create) {
+    // Anchor at the canonical allowed root that contains the target — either matched
+    // directly or reached through a configured (possibly symlink-spelled) root — then
+    // create component-by-component. A mid-path symlink is rejected before any mkdir
+    // can follow it outside the root.
+    let anchor: string;
+    let rel: string;
+    const canonical = roots.find((root) => isInside(lexical, root));
+    if (canonical !== undefined) {
+      anchor = canonical;
+      rel = path.relative(canonical, lexical);
+    } else {
+      const spelled = configuredRoots().find((root) => isInside(lexical, root));
+      if (spelled === undefined) throw outsideRootsError(roots);
+      try {
+        anchor = realpathSync(spelled);
+      } catch {
+        throw outsideRootsError(roots);
+      }
+      rel = path.relative(spelled, lexical);
+    }
+    return ensureDirWithin(anchor, rel === "" ? anchor : path.join(anchor, rel));
+  }
 
-  // Canonical re-verify after any creation: a symlinked component can resolve outside the
-  // root that passed the lexical gate. Residual: with `create`, mkdirSync may already have
-  // made directories through a mid-path symlink before this check rejects the target.
+  // Browsing creates nothing: canonical re-verify suffices — a symlinked component can
+  // resolve outside the root that passed the lexical gate.
   let resolved: string;
   try {
     resolved = realpathSync(lexical);
