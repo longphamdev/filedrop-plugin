@@ -1,0 +1,7 @@
+{
+  "id": "filedrop",
+  "description": "Drag-drop file upload from the browser into a directory on this host",
+  "requirements": {
+    "paseo": ">=0.17.0"
+  }
+}
