@@ -1,6 +1,11 @@
 {
   "id": "filedrop",
+  "name": "Filedrop",
   "description": "Drag-drop file upload from the browser into a directory on this host",
+  "media": [
+    "media/explorer-panel.png",
+    "media/explorer-menu.png"
+  ],
   "requirements": {
     "paseo": ">=0.17.0"
   },

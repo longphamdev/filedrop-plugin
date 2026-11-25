@@ -23,6 +23,7 @@
     "client",
     "server",
     "shared",
-    "README.md"
+    "README.md",
+    "media"
   ]
 }
