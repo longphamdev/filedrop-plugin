@@ -5,10 +5,12 @@ import { Platform, Pressable, Text, View } from "react-native";
 import {
   FILEDROP_EXISTS,
   downloadChunkRpc,
+  downloadDirRpc,
   existsRpc,
   listDirsRpc,
   uploadChunkRpc,
 } from "../shared/rpc";
+import { downloadDirChunks } from "./download-dir";
 import { downloadFileChunks } from "./download-file";
 import { initTargetState, reduceWorkspaceDir, setManualTarget } from "./target";
 import { uploadFileChunks } from "./upload-file";
@@ -44,7 +46,8 @@ type QueueJob =
       uploadId: string;
       overwrite: boolean;
     }
-  | { kind: "download"; id: number; path: string };
+  | { kind: "download"; id: number; path: string }
+  | { kind: "pack"; id: number; path: string };
 
 interface BrowseState {
   path: string;
@@ -64,6 +67,7 @@ function formatBytes(bytes: number): string {
 export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePanelProps) {
   const uploadChunk = useRpc(uploadChunkRpc);
   const downloadChunk = useRpc(downloadChunkRpc);
+  const downloadDir = useRpc(downloadDirRpc);
   const exists = useRpc(existsRpc);
   const listDirs = useRpc(listDirsRpc);
   const toast = useToast();
@@ -92,9 +96,24 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
   // Host→client download side: a path input plus a file-listing browse (dirs navigate,
   // files enqueue a download). Kept separate from the dir-picker browse above.
   const [downloadPath, setDownloadPath] = useState("");
+  // Prefill the download path with the workspace dir — mirrors the upload target input
+  // so the base dir is visible and the user just appends the filename. Re-anchors on a
+  // workspace switch, but only when the box is empty or still shows the previous
+  // prefill: text the user typed is never clobbered.
+  const dlPrefillForRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!workspaceDir || dlPrefillForRef.current === workspaceDir) return;
+    setDownloadPath((prev) => {
+      const untouched = prev === "" || prev === dlPrefillForRef.current;
+      if (!untouched) return prev;
+      dlPrefillForRef.current = workspaceDir;
+      return workspaceDir;
+    });
+  }, [workspaceDir]);
   const [dlBrowseOpen, setDlBrowseOpen] = useState(false);
   const [dlBrowse, setDlBrowse] = useState<BrowseState | null>(null);
   const [dlBrowseError, setDlBrowseError] = useState<string | null>(null);
+  const dlBrowseReqRef = useRef(0);
 
   const queueRef = useRef<QueueJob[]>([]);
   const busyRef = useRef(false);
@@ -109,6 +128,8 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
   uploadRef.current = uploadChunk;
   const downloadRef = useRef(downloadChunk);
   downloadRef.current = downloadChunk;
+  const downloadDirRef = useRef(downloadDir);
+  downloadDirRef.current = downloadDir;
   const existsRef = useRef(exists);
   existsRef.current = exists;
   const listDirsRef = useRef(listDirs);
@@ -180,6 +201,34 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
     [updateItem],
   );
 
+  // Folder download: the daemon walks the tree, packs one zip, stages it, then this
+  // pulls it down with the same chunked loop. One row per folder — no N-row flood.
+  const packOne = useCallback(
+    async (job: Extract<QueueJob, { kind: "pack" }>) => {
+      updateItem(job.id, { status: "transferring" });
+      try {
+        const pack = await downloadDirChunks({
+          path: job.path,
+          send: async (input) => {
+            const result = await downloadDirRef.current(input);
+            // Size is null while the daemon is still packing — pin it once it lands.
+            if (result.size !== null) updateItem(job.id, { size: result.size });
+            return result;
+          },
+          onReceived: (bytes) => updateItem(job.id, { sent: bytes }),
+        });
+        if (!saveBlobAs(pack.name, pack.parts)) {
+          throw new Error("Saving downloads is only available in the browser");
+        }
+        updateItem(job.id, { status: "done", sent: pack.size, size: pack.size });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        updateItem(job.id, { status: "error", error: message });
+      }
+    },
+    [updateItem],
+  );
+
   // Sequential by design: one file at a time, one chunk in flight. The re-check after
   // releasing `busy` closes the race where a drop lands between the empty-queue break and
   // the release — without it that job would sit `queued` forever.
@@ -192,6 +241,8 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
         if (!job) break;
         if (job.kind === "download") {
           await downloadOne(job);
+        } else if (job.kind === "pack") {
+          await packOne(job);
         } else {
           await uploadOne(job);
         }
@@ -200,7 +251,7 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
       busyRef.current = false;
       if (queueRef.current.length > 0) void drain();
     }
-  }, [downloadOne, uploadOne]);
+  }, [downloadOne, packOne, uploadOne]);
 
   const handleFiles = useCallback(
     (files: DroppedFile[], failures: DropFailure[] = []) => {
@@ -377,23 +428,73 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
     [drain],
   );
 
-  const startDownload = useCallback(() => {
-    enqueueDownload(downloadPath.trim());
-    setDownloadPath("");
-  }, [downloadPath, enqueueDownload]);
-
-  const dlBrowseTo = useCallback(async (path?: string) => {
+  const dlBrowseTo = useCallback(async (path?: string, retryParent = false) => {
     setDlBrowseError(null);
+    // Generation guard: only the latest request may land — a stale response arriving
+    // after a newer one would repaint the list with the wrong directory.
+    const reqId = ++dlBrowseReqRef.current;
     try {
       const result = await listDirsRef.current(
         path ? { path, includeFiles: true } : { includeFiles: true },
       );
+      if (reqId !== dlBrowseReqRef.current) return;
       setDlBrowse(result);
     } catch (error) {
+      if (reqId !== dlBrowseReqRef.current) return;
+      const message = error instanceof Error ? error.message : String(error);
+      // A typed anchor may name a file — the server can't tell without listing. On
+      // ENOTDIR, retry the containing dir so the file shows up in the list.
+      if (retryParent && path && message.includes("ENOTDIR")) {
+        const slash = path.replace(/\/+$/, "").lastIndexOf("/");
+        void dlBrowseTo(slash > 0 ? path.slice(0, slash) : undefined);
+        return;
+      }
       setDlBrowse(null);
-      setDlBrowseError(error instanceof Error ? error.message : String(error));
+      setDlBrowseError(message);
     }
   }, []);
+
+  const startDownload = useCallback(() => {
+    const typed = downloadPath.trim();
+    // Relative names resolve against the same directory uploads target — the workspace
+    // dir by default — so `foo.txt` and `~/foo.txt` and `/abs/foo.txt` all work.
+    // Home paths are only `~` or `~/…` — a leading `~` on anything else (a real file
+    // literally named `~notes.txt`) must stay a relative name, matching expandHome.
+    const isHome = typed === "~" || typed.startsWith("~/");
+    const resolved =
+      typed && !typed.startsWith("/") && !isHome
+        ? `${targetDirRef.current.replace(/\/+$/, "")}/${typed}`
+        : typed;
+    if (!resolved) return;
+    const openBrowse = () => {
+      setDlBrowseOpen(true);
+      void dlBrowseTo(resolved);
+    };
+    // `~` alone and trailing-/ paths are dirs by spelling — open the browser on them.
+    if (resolved === "~" || resolved.endsWith("/")) {
+      openBrowse();
+      return;
+    }
+    // Anything else might still be a dir (e.g. the prefilled workspace dir has no
+    // trailing slash). Probe once: isDir → browse there; otherwise enqueue the file.
+    const slash = resolved.lastIndexOf("/");
+    const parent = slash > 0 ? resolved.slice(0, slash) : "/";
+    const leaf = resolved.slice(slash + 1);
+    void (async () => {
+      try {
+        const probe = await existsRef.current({ targetDir: parent, relativePath: leaf });
+        if (probe.exists && probe.isDir) {
+          openBrowse();
+          return;
+        }
+      } catch {
+        // Probe failed (outside roots, bad name) — fall through and let the download
+        // row carry the real server error.
+      }
+      enqueueDownload(resolved);
+      setDownloadPath("");
+    })();
+  }, [downloadPath, enqueueDownload, dlBrowseTo]);
 
   const toggleDlBrowse = useCallback(() => {
     if (dlBrowseOpen) {
@@ -401,9 +502,29 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
       return;
     }
     setDlBrowseOpen(true);
-    // Anchor at the upload target — it's the directory the user is already working in.
-    void dlBrowseTo(targetDirRef.current.trim() || undefined);
-  }, [dlBrowseOpen, dlBrowseTo]);
+    // Anchor at the typed path (the prefilled workspace dir), falling back to the upload
+    // target. Whether it names a file or dir is the server's call — retryParent lets a
+    // file path fall back to its containing dir instead of erroring.
+    const anchor = downloadPath.trim() || targetDirRef.current.trim() || undefined;
+    void dlBrowseTo(anchor, true);
+  }, [dlBrowseOpen, dlBrowseTo, downloadPath]);
+
+  // Mirror of "Choose a folder instead" on the upload side: the daemon walks the tree
+  // and packs one zip server-side, so a folder is a single transfer row — no client
+  // walk, no per-file rows, and a pack failure surfaces as a real error row.
+  const downloadFolder = useCallback(
+    (dirPath: string) => {
+      const id = nextIdRef.current++;
+      const leaf = dirPath.split("/").filter((s) => s.length > 0).pop() ?? dirPath;
+      setItems((prev) => [
+        { id, name: `${leaf}.zip`, size: 0, sent: 0, status: "queued", targetDir: "", direction: "down" },
+        ...prev,
+      ]);
+      queueRef.current.push({ kind: "pack", id, path: dirPath });
+      void drain();
+    },
+    [drain],
+  );
 
   const clearFinished = useCallback(() => {
     // "confirm" rows are unresolved decisions, not finished — keep them (and their parked jobs).
@@ -419,10 +540,9 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
     () => ({
       screen: {
         flex: 1,
-        padding: pad,
-        gap: pad,
         backgroundColor: theme.colors.surface0,
       },
+      screenContent: { padding: pad, gap: pad },
       headingRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 8 },
       heading: { color: theme.colors.foreground, fontSize: layout.compact ? 16 : 18, fontWeight: "600" as const },
       label: { color: theme.colors.foregroundMuted, fontSize: 12 },
@@ -500,6 +620,7 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
         paddingHorizontal: 8,
       },
       folderPickText: { color: theme.colors.foregroundMuted, fontSize: 12 },
+
       itemRow: {
         flexDirection: "row" as const,
         alignItems: "center" as const,
@@ -533,7 +654,7 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
   const conflictCount = items.reduce((count, item) => count + (item.status === "confirm" ? 1 : 0), 0);
 
   return (
-    <View style={styles.screen}>
+    <ScrollView style={styles.screen} contentContainerStyle={styles.screenContent}>
       <View style={styles.headingRow}>
         <Icon name="Upload" size={18} color={theme.colors.foreground} />
         <Text style={styles.heading}>File drop</Text>
@@ -560,7 +681,7 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
           <Text style={styles.browsePath}>{browse ? browse.path : "Loading…"}</Text>
           {browseError ? <Text style={styles.errorText}>{browseError}</Text> : null}
           {browse ? (
-            <ScrollView>
+            <ScrollView keyboardShouldPersistTaps="handled">
               {browse.parent ? (
                 <Pressable
                   accessibilityRole="button"
@@ -648,22 +769,20 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
         </Pressable>
       ) : null}
 
-      <Text style={styles.label}>Download a file from this host</Text>
+      <Text style={styles.label}>Download from this host</Text>
       <View style={styles.inputRow}>
         <TextInput
           style={styles.input}
           value={downloadPath}
           onChangeText={setDownloadPath}
-          placeholder="/absolute/path or ~/path"
+          onSubmitEditing={startDownload}
+          placeholder="~/file, /absolute/file, or file-in-workspace"
           placeholderTextColor={theme.colors.foregroundMuted}
           autoCapitalize="none"
           autoCorrect={false}
         />
         <Pressable accessibilityRole="button" onPress={toggleDlBrowse} style={styles.button}>
-          <Text style={styles.buttonText}>{dlBrowseOpen ? "Close" : "Browse files"}</Text>
-        </Pressable>
-        <Pressable accessibilityRole="button" onPress={startDownload} style={styles.buttonAccent}>
-          <Text style={styles.buttonAccentText}>Download</Text>
+          <Text style={styles.buttonText}>{dlBrowseOpen ? "Close" : "Browse"}</Text>
         </Pressable>
       </View>
 
@@ -672,7 +791,7 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
           <Text style={styles.browsePath}>{dlBrowse ? dlBrowse.path : "Loading…"}</Text>
           {dlBrowseError ? <Text style={styles.errorText}>{dlBrowseError}</Text> : null}
           {dlBrowse ? (
-            <ScrollView>
+            <ScrollView keyboardShouldPersistTaps="handled">
               {dlBrowse.parent ? (
                 <Pressable
                   accessibilityRole="button"
@@ -683,6 +802,15 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
                   <Text style={styles.browseRowText}>..</Text>
                 </Pressable>
               ) : null}
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Download all files in this folder"
+                onPress={() => void downloadFolder(dlBrowse.path)}
+                style={styles.browseRow}
+              >
+                <Icon name="ArrowDownToLine" size={14} color={theme.colors.accent} />
+                <Text style={styles.browseRowText}>Download all files in this folder</Text>
+              </Pressable>
               {dlBrowse.entries.map((entry) => (
                 <Pressable
                   key={entry.path}
@@ -820,6 +948,6 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
           </ScrollView>
         </View>
       ) : null}
-    </View>
+    </ScrollView>
   );
 }

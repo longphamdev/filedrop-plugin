@@ -105,3 +105,37 @@ export const downloadChunkRpc = defineRpc({
     fileId: z.string(),
   }),
 });
+
+// Folder download: the daemon walks a directory inside the allowed roots (regular files
+// only — symlinks and special files are skipped, exactly the set `list-dirs` exposes)
+// and packs it into a zip staged in os.tmpdir(). Packing is ASYNC — the first call
+// (no packId) starts the pack in the background and returns a packId immediately;
+// later calls echo it and pull whatever bytes have been written so far, long-polling
+// a few seconds when the reader catches up with the writer. `done` marks the archive
+// complete; `size` stays null until then.
+export const downloadDirRpc = defineRpc({
+  name: "filedrop.download-dir",
+  input: z.object({
+    // Absolute dir path on the host (or ~/…); only meaningful on the first call.
+    path: z.string().min(1).max(4096),
+    offset: z.number().int().nonnegative(),
+    maxBytes: z.number().int().positive().max(8 * 1024 * 1024).optional(),
+    // Staged-pack handle from the first response — pins subsequent chunks to that
+    // archive; the staged file is deleted when its TTL expires.
+    packId: z.string().max(64).optional(),
+  }),
+  output: z.object({
+    // Canonical path of the directory that was packed.
+    path: z.string(),
+    // Suggested archive filename — "<dirname>.zip".
+    name: z.string(),
+    // Final archive size, null while the pack is still running.
+    size: z.number().int().nonnegative().nullable(),
+    dataBase64: z.string(),
+    bytesRead: z.number().int().nonnegative(),
+    // True when the pack has finished and every archive byte has been served — the
+    // client may stop pulling.
+    done: z.boolean(),
+    packId: z.string(),
+  }),
+});

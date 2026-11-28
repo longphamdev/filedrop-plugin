@@ -97,7 +97,10 @@ export function ensureDirWithin(anchor: string, dir: string): string {
 // Resolves a user-supplied directory to a canonical path inside an allowed root.
 // `create` performs the documented `mkdir -p` for upload targets; browsing never creates.
 export function resolveTargetDir(input: string, options: { create: boolean }): string {
-  const expanded = expandHome(input.trim());
+  // No trim — same contract as resolveReadablePath: browsed/typed paths must round-trip
+  // byte-exact, and a dir whose name ends in a space is otherwise unreachable. The
+  // panel already trims typed input before sending.
+  const expanded = expandHome(input);
   if (expanded.includes("\0")) throw new Error("Invalid path");
   if (!path.isAbsolute(expanded)) {
     throw new Error("Target directory must be an absolute path (or start with ~/)");

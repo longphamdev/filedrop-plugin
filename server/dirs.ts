@@ -7,7 +7,9 @@ import { allowedRoots, isInside, resolveTargetDir } from "./paths";
 const MAX_ENTRIES = 500;
 
 export function listDirs(input: RpcInput<typeof listDirsRpc>) {
-  const resolved = resolveTargetDir(input.path?.trim() || "~", { create: false });
+  // No trim: browsed paths must round-trip exactly — whitespace-named dirs are legal on
+  // POSIX, and the panel already trims its typed input before sending.
+  const resolved = resolveTargetDir(input.path || "~", { create: false });
   const includeFiles = input.includeFiles === true;
   const all = readdirSync(resolved, { withFileTypes: true })
     .filter(
