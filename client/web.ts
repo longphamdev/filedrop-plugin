@@ -87,9 +87,22 @@ interface WebFileInputLike extends WebElementLike {
   remove(): void;
 }
 
+interface WebAnchorLike extends WebElementLike {
+  href: string;
+  download: string;
+  click(): void;
+  remove(): void;
+}
+
 interface WebDocumentLike {
+  createElement(tag: "a"): WebAnchorLike;
   createElement(tag: string): WebFileInputLike;
   body: WebElementLike;
+}
+
+interface WebUrlLike {
+  createObjectURL(blob: WebBlobLike): string;
+  revokeObjectURL(url: string): void;
 }
 
 interface WebFileReaderLike {
@@ -100,6 +113,8 @@ interface WebFileReaderLike {
 }
 
 declare const FileReader: { new (): WebFileReaderLike };
+declare const Blob: { new (parts: readonly Uint8Array[]): WebBlobLike };
+declare const URL: WebUrlLike;
 declare const document: WebDocumentLike;
 
 // Cross-platform surface of a dropped file. `relativePath` carries webkitRelativePath for
@@ -316,6 +331,25 @@ export function openFilePicker(options: { directory?: boolean } = {}): Promise<D
     document.body.appendChild(input);
     input.click();
   });
+}
+
+// Triggers a browser save for a downloaded host file: parts go straight into a Blob (no
+// concatenation), an object URL feeds a temporary anchor with `download` set. Returns
+// false off-web — a native build has no save dialog to drive.
+export function saveBlobAs(name: string, parts: readonly Uint8Array[]): boolean {
+  if (Platform.OS !== "web") return false;
+  const blob = new Blob(parts);
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = name;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  // The click hands the URL to the download synchronously, but revoke late anyway — some
+  // browsers tear down the save if the URL dies inside the same task.
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+  return true;
 }
 
 export function readBlobBase64(blob: DroppedBlob): Promise<string> {

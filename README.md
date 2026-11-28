@@ -1,14 +1,14 @@
 # filedrop
 
-Drag-and-drop and click-to-browse file upload for [Paseo](https://paseo.sh). Drop files or
-folders from the machine running the Paseo app (your browser) and they land in a directory
-on the daemon host.
+Two-way file transfer for [Paseo](https://paseo.sh). Drop files or folders from the
+machine running the Paseo app (your browser) and they land in a directory on the daemon
+host — or browse the host filesystem and pull files back down to your client.
 
 ## Requirements
 
 - Paseo daemon **>= 0.17.0** with `pluginsEnabled: true` in its `config.json`.
-- The Paseo **web or desktop app** for drag-drop and the file pickers. Native clients see
-  the panel and directory browser but cannot drop.
+- The Paseo **web or desktop app** for drag-drop, the file pickers, and saving downloads.
+  Native clients see the panel and both browsers but cannot drop or save.
 
 ## Install
 
@@ -31,13 +31,30 @@ Source edits need `paseo plugin reload filedrop` — never restart the daemon to
   recreated on the host.
 - Dropping onto an existing filename parks the row behind an **"exists — overwrite?"**
   decision; when several collide you get **Overwrite all / Skip all**.
-- Every upload shows progress, final size, or an error row. **Clear finished** tidies the list.
+- To **download** from the host, type an absolute path (or `~/path`) under *Download a
+  file from this host* and press **Download**, or press **Browse files** to walk the host
+  filesystem — folders navigate, clicking a file saves it through your browser's normal
+  download flow. Saving is web/desktop only.
+- Uploads and downloads share one sequential **Transfers** list — progress, final size,
+  or an error row each. **Clear finished** tidies it.
 
 ## Safety design
 
-- Writes are confined to **allowed roots** — the daemon user's home directory by default.
-  Widen with the `FILEDROP_ALLOWED_ROOTS` environment variable on the daemon
-  (path-delimited, e.g. `/data:/srv/uploads`).
+- Writes **and reads** are confined to **allowed roots** — the daemon user's home
+  directory by default. Widen with the `FILEDROP_ALLOWED_ROOTS` environment variable on
+  the daemon (path-delimited, e.g. `/data:/srv/uploads`).
+- Downloads are read-class, like browsing: the requested path is contained lexically
+  then canonicalized, so a symlink pointing outside the roots is refused while an
+  interior symlink resolves fine. The canonical path is opened `O_NOFOLLOW | O_NONBLOCK`
+  and `fstat`-verified as a regular file — directories, fifos, and race-swapped links
+  are rejected. After the open, the canonical name is re-resolved and the fd's device +
+  inode compared, so a mid-path component raced to a symlink between resolve and open
+  cannot walk the read outside the roots; each chunk call then pins that inode via a
+  `fileId` the client echoes, so a same-size replacement mid-download is rejected
+  instead of silently mixing bytes.
+- Downloads assemble the whole file in the client's browser memory before saving (Blob +
+  object URL — inherent to browser saves without a streaming File System Access
+  fallback). Fine for typical files; pulling multi-GB files can strain a browser tab.
 - `..` segments are rejected outright; paths are contained lexically **before** any
   directory is created and re-verified canonically after — a symlinked component that
   resolves outside the root is refused.
@@ -62,8 +79,8 @@ index.client.tsx       panel + Command Center registrations
 index.server.ts        RPC handler registrations
 client/                app-side UI — React Native primitives only;
                        all DOM lives in client/web.ts, gated on Platform.OS === "web"
-server/                daemon subprocess — fs containment, chunked writes, dir listing
-shared/rpc.ts          Zod RPC contracts (filedrop.upload / .exists / .list-dirs)
+server/                daemon subprocess — fs containment, chunked writes/reads, dir listing
+shared/rpc.ts          Zod RPC contracts (filedrop.upload / .exists / .list-dirs / .download)
 docs/                  SLOP intake and workspace protocol
 ```
 

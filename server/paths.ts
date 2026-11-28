@@ -154,6 +154,43 @@ export function resolveTargetDir(input: string, options: { create: boolean }): s
   return resolved;
 }
 
+// Resolves a user-supplied file path for reading: same gates as the browse half of
+// resolveTargetDir (lexical containment first, then canonical re-verify) except the result
+// may be any existing path — the caller fstat-verifies it is a regular file. Reads are a
+// browse-class operation: an interior symlink is allowed because the returned canonical
+// path is provably inside a root.
+export function resolveReadablePath(input: string): string {
+  // No trim: browsed paths must round-trip exactly — upload and browse preserve
+  // edge-whitespace names, and the panel already trims typed input before sending.
+  const expanded = expandHome(input);
+  if (expanded.includes("\0")) throw new Error("Invalid path");
+  if (!path.isAbsolute(expanded)) {
+    throw new Error("File path must be an absolute path (or start with ~/)");
+  }
+  const roots = allowedRoots();
+  if (roots.length === 0) {
+    throw new Error("No readable roots are configured on this host");
+  }
+  const lexical = path.resolve(expanded);
+  const inside =
+    roots.some((root) => isInside(lexical, root)) ||
+    configuredRoots().some((root) => isInside(lexical, root));
+  if (!inside) throw outsideRootsError(roots);
+
+  let resolved: string;
+  try {
+    resolved = realpathSync(lexical);
+  } catch {
+    const error = new Error(`File does not exist: ${lexical}`) as NodeJS.ErrnoException;
+    error.code = "ENOENT";
+    throw error;
+  }
+  if (!roots.some((root) => isInside(resolved, root))) {
+    throw outsideRootsError(roots);
+  }
+  return resolved;
+}
+
 // A dropped name is either a bare filename or a '/'-separated relative path (folder drops).
 // POSIX semantics: only '/' separates segments — a backslash is a legal filename character,
 // so "a\b.txt" stays one segment. '..' anywhere is rejected outright so traversal can never

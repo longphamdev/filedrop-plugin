@@ -9,11 +9,24 @@ export const FILEDROP_EXISTS = "FILEDROP_EXISTS";
 
 export const listDirsRpc = defineRpc({
   name: "filedrop.list-dirs",
-  input: z.object({ path: z.string().max(4096).optional() }),
+  input: z.object({
+    path: z.string().max(4096).optional(),
+    // The target-directory picker lists directories only; the download browser sets this
+    // to include regular files (dirs sort first, then files, both alphabetical).
+    includeFiles: z.boolean().optional(),
+  }),
   output: z.object({
     path: z.string(),
     parent: z.string().nullable(),
-    entries: z.array(z.object({ name: z.string(), path: z.string() })),
+    entries: z.array(
+      z.object({
+        name: z.string(),
+        path: z.string(),
+        isDir: z.boolean(),
+        // Present on regular files only.
+        size: z.number().int().nonnegative().optional(),
+      }),
+    ),
     // Listing caps at 500 entries; when truncated, `total` lets the client show "N more".
     truncated: z.boolean(),
     total: z.number().int().nonnegative(),
@@ -62,5 +75,33 @@ export const uploadChunkRpc = defineRpc({
   output: z.object({
     path: z.string(),
     bytesWritten: z.number().int().nonnegative(),
+  }),
+});
+
+// Downloads are the pull mirror of uploads: the client requests one chunk per call at an
+// explicit offset and the daemon returns base64 plus the file's size so the client can
+// loop until it has the whole file. `path` is verified inside the allowed roots exactly
+// like browsed paths — reads can no more escape the roots than browsing can.
+export const downloadChunkRpc = defineRpc({
+  name: "filedrop.download",
+  input: z.object({
+    // Absolute path on the host (or ~/…), as returned by list-dirs browsing.
+    path: z.string().min(1).max(4096),
+    offset: z.number().int().nonnegative(),
+    // Per-call read cap; the server clamps it to 8 MiB and the client pulls 256 KiB.
+    maxBytes: z.number().int().positive().max(8 * 1024 * 1024).optional(),
+    // "dev:ino" from the first chunk's response, echoed on later chunks — pins the
+    // download to one inode so a same-size file swapped in mid-download is rejected
+    // instead of silently mixing bytes.
+    fileId: z.string().max(64).optional(),
+  }),
+  output: z.object({
+    // The canonical path actually read — every symlink resolved, inside an allowed root.
+    path: z.string(),
+    size: z.number().int().nonnegative(),
+    dataBase64: z.string(),
+    bytesRead: z.number().int().nonnegative(),
+    // "dev:ino" of the file actually opened, verified fresh on every call.
+    fileId: z.string(),
   }),
 });

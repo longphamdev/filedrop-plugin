@@ -1,4 +1,4 @@
-import { readdirSync } from "node:fs";
+import { lstatSync, readdirSync } from "node:fs";
 import path from "node:path";
 import type { RpcInput } from "@getpaseo/plugin";
 import type { listDirsRpc } from "../shared/rpc";
@@ -8,10 +8,30 @@ const MAX_ENTRIES = 500;
 
 export function listDirs(input: RpcInput<typeof listDirsRpc>) {
   const resolved = resolveTargetDir(input.path?.trim() || "~", { create: false });
+  const includeFiles = input.includeFiles === true;
   const all = readdirSync(resolved, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-    .map((entry) => ({ name: entry.name, path: path.join(resolved, entry.name) }))
-    .sort((a, b) => a.name.localeCompare(b.name));
+    .filter(
+      (entry) =>
+        !entry.name.startsWith(".") && (entry.isDirectory() || (includeFiles && entry.isFile())),
+    )
+    .map((entry) => {
+      const entryPath = path.join(resolved, entry.name);
+      let size: number | undefined;
+      if (entry.isFile()) {
+        try {
+          // The Dirent said "file", but the entry may have been swapped since readdir —
+          // only report a size when the fresh lstat still sees a regular file, so a
+          // symlink or fifo that raced in never lends its own stat to a file row.
+          const fresh = lstatSync(entryPath);
+          if (fresh.isFile()) size = fresh.size;
+        } catch {
+          // A file that vanishes mid-listing reports no size rather than failing the list.
+        }
+      }
+      return { name: entry.name, path: entryPath, isDir: entry.isDirectory(), size };
+    })
+    // Directories first (they navigate), then files; alphabetical within each group.
+    .sort((a, b) => Number(b.isDir) - Number(a.isDir) || a.name.localeCompare(b.name));
 
   const parentPath = path.dirname(resolved);
   const roots = allowedRoots();

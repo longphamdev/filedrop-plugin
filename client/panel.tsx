@@ -2,18 +2,26 @@ import { type PluginWorkspacePanelProps, useRpc, useWorkspace } from "@getpaseo/
 import { Icon, ScrollView, TextInput, useToast } from "@getpaseo/plugin/client/react-native";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Platform, Pressable, Text, View } from "react-native";
-import { FILEDROP_EXISTS, existsRpc, listDirsRpc, uploadChunkRpc } from "../shared/rpc";
+import {
+  FILEDROP_EXISTS,
+  downloadChunkRpc,
+  existsRpc,
+  listDirsRpc,
+  uploadChunkRpc,
+} from "../shared/rpc";
+import { downloadFileChunks } from "./download-file";
 import { initTargetState, reduceWorkspaceDir, setManualTarget } from "./target";
 import { uploadFileChunks } from "./upload-file";
 import {
   attachDropZone,
   openFilePicker,
   readBlobBase64,
+  saveBlobAs,
   type DroppedFile,
   type DropFailure,
 } from "./web";
 
-type UploadStatus = "queued" | "confirm" | "uploading" | "done" | "error";
+type UploadStatus = "queued" | "confirm" | "transferring" | "done" | "error";
 
 interface UploadItem {
   id: number;
@@ -23,20 +31,25 @@ interface UploadItem {
   status: UploadStatus;
   error?: string;
   targetDir: string;
+  // "up" is a client→host upload, "down" a host→client download.
+  direction: "up" | "down";
 }
 
-interface QueueJob {
-  id: number;
-  file: DroppedFile;
-  targetDir: string;
-  uploadId: string;
-  overwrite: boolean;
-}
+type QueueJob =
+  | {
+      kind: "upload";
+      id: number;
+      file: DroppedFile;
+      targetDir: string;
+      uploadId: string;
+      overwrite: boolean;
+    }
+  | { kind: "download"; id: number; path: string };
 
 interface BrowseState {
   path: string;
   parent: string | null;
-  entries: { name: string; path: string }[];
+  entries: { name: string; path: string; isDir: boolean; size?: number }[];
   truncated: boolean;
   total: number;
 }
@@ -50,6 +63,7 @@ function formatBytes(bytes: number): string {
 
 export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePanelProps) {
   const uploadChunk = useRpc(uploadChunkRpc);
+  const downloadChunk = useRpc(downloadChunkRpc);
   const exists = useRpc(existsRpc);
   const listDirs = useRpc(listDirsRpc);
   const toast = useToast();
@@ -75,16 +89,26 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
   const [browseOpen, setBrowseOpen] = useState(false);
   const [browse, setBrowse] = useState<BrowseState | null>(null);
   const [browseError, setBrowseError] = useState<string | null>(null);
+  // Host→client download side: a path input plus a file-listing browse (dirs navigate,
+  // files enqueue a download). Kept separate from the dir-picker browse above.
+  const [downloadPath, setDownloadPath] = useState("");
+  const [dlBrowseOpen, setDlBrowseOpen] = useState(false);
+  const [dlBrowse, setDlBrowse] = useState<BrowseState | null>(null);
+  const [dlBrowseError, setDlBrowseError] = useState<string | null>(null);
 
   const queueRef = useRef<QueueJob[]>([]);
   const busyRef = useRef(false);
   const nextIdRef = useRef(1);
   // Jobs parked behind an "exists — overwrite?" decision, keyed by their row id.
-  const pendingConfirmsRef = useRef(new Map<number, QueueJob>());
+  const pendingConfirmsRef = useRef(
+    new Map<number, Extract<QueueJob, { kind: "upload" }>>(),
+  );
   const targetDirRef = useRef(targetDir);
   targetDirRef.current = targetDir;
   const uploadRef = useRef(uploadChunk);
   uploadRef.current = uploadChunk;
+  const downloadRef = useRef(downloadChunk);
+  downloadRef.current = downloadChunk;
   const existsRef = useRef(exists);
   existsRef.current = exists;
   const listDirsRef = useRef(listDirs);
@@ -98,8 +122,8 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
   }, []);
 
   const uploadOne = useCallback(
-    async (job: QueueJob) => {
-      updateItem(job.id, { status: "uploading" });
+    async (job: Extract<QueueJob, { kind: "upload" }>) => {
+      updateItem(job.id, { status: "transferring" });
       try {
         await uploadFileChunks({
           targetDir: job.targetDir,
@@ -126,6 +150,36 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
     [updateItem],
   );
 
+  // Pulls a host file into memory chunk-by-chunk, then hands the parts to the browser's
+  // save machinery. Native builds can fetch but have no save dialog — surface that as an
+  // item error rather than silently dropping the bytes.
+  const downloadOne = useCallback(
+    async (job: Extract<QueueJob, { kind: "download" }>) => {
+      updateItem(job.id, { status: "transferring" });
+      try {
+        const file = await downloadFileChunks({
+          path: job.path,
+          // The row is created with size 0 — pin it from the FIRST response only, so a
+          // file growing mid-download doesn't inflate the percentage's denominator.
+          send: async (input) => {
+            const result = await downloadRef.current(input);
+            if (input.offset === 0) updateItem(job.id, { size: result.size });
+            return result;
+          },
+          onReceived: (bytes) => updateItem(job.id, { sent: bytes }),
+        });
+        if (!saveBlobAs(file.name, file.parts)) {
+          throw new Error("Saving downloads is only available in the browser");
+        }
+        updateItem(job.id, { status: "done", sent: file.size, size: file.size });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        updateItem(job.id, { status: "error", error: message });
+      }
+    },
+    [updateItem],
+  );
+
   // Sequential by design: one file at a time, one chunk in flight. The re-check after
   // releasing `busy` closes the race where a drop lands between the empty-queue break and
   // the release — without it that job would sit `queued` forever.
@@ -136,13 +190,17 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
       for (;;) {
         const job = queueRef.current.shift();
         if (!job) break;
-        await uploadOne(job);
+        if (job.kind === "download") {
+          await downloadOne(job);
+        } else {
+          await uploadOne(job);
+        }
       }
     } finally {
       busyRef.current = false;
       if (queueRef.current.length > 0) void drain();
     }
-  }, [uploadOne]);
+  }, [downloadOne, uploadOne]);
 
   const handleFiles = useCallback(
     (files: DroppedFile[], failures: DropFailure[] = []) => {
@@ -163,6 +221,7 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
           status: "error",
           error: failure.message,
           targetDir: dir,
+          direction: "up",
         }));
         const checks = await Promise.all(
           files.map(async (file) => {
@@ -182,12 +241,20 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
         const jobs: QueueJob[] = [];
         for (const { file, hit } of checks) {
           const id = nextId();
-          const base = { id, name: file.relativePath, size: file.size, sent: 0, targetDir: dir };
+          const base = {
+            id,
+            name: file.relativePath,
+            size: file.size,
+            sent: 0,
+            targetDir: dir,
+            direction: "up" as const,
+          };
           if (hit?.exists && hit.isDir) {
             rows.push({ ...base, status: "error", error: "A folder already exists at this path" });
             continue;
           }
           const job: QueueJob = {
+            kind: "upload",
             id,
             file,
             targetDir: dir,
@@ -291,11 +358,58 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
     toast.show(`Target set to ${browse.path}`, { variant: "success" });
   }, [browse, toast]);
 
+  // A download job carries the host path the daemon will read — the daemon confines it
+  // to the allowed roots, so a mistyped path fails as an item error, not a write.
+  // No trim here: browsed paths must round-trip exactly (edge-whitespace names are
+  // legal), and the typed input is trimmed in startDownload before it gets here.
+  const enqueueDownload = useCallback(
+    (hostPath: string) => {
+      if (!hostPath.trim()) return;
+      const id = nextIdRef.current;
+      nextIdRef.current += 1;
+      queueRef.current.push({ kind: "download", id, path: hostPath });
+      setItems((prev) => [
+        ...prev,
+        { id, name: hostPath, size: 0, sent: 0, status: "queued", targetDir: "", direction: "down" },
+      ]);
+      void drain();
+    },
+    [drain],
+  );
+
+  const startDownload = useCallback(() => {
+    enqueueDownload(downloadPath.trim());
+    setDownloadPath("");
+  }, [downloadPath, enqueueDownload]);
+
+  const dlBrowseTo = useCallback(async (path?: string) => {
+    setDlBrowseError(null);
+    try {
+      const result = await listDirsRef.current(
+        path ? { path, includeFiles: true } : { includeFiles: true },
+      );
+      setDlBrowse(result);
+    } catch (error) {
+      setDlBrowse(null);
+      setDlBrowseError(error instanceof Error ? error.message : String(error));
+    }
+  }, []);
+
+  const toggleDlBrowse = useCallback(() => {
+    if (dlBrowseOpen) {
+      setDlBrowseOpen(false);
+      return;
+    }
+    setDlBrowseOpen(true);
+    // Anchor at the upload target — it's the directory the user is already working in.
+    void dlBrowseTo(targetDirRef.current.trim() || undefined);
+  }, [dlBrowseOpen, dlBrowseTo]);
+
   const clearFinished = useCallback(() => {
     // "confirm" rows are unresolved decisions, not finished — keep them (and their parked jobs).
     setItems((prev) =>
       prev.filter(
-        (item) => item.status === "queued" || item.status === "confirm" || item.status === "uploading",
+        (item) => item.status === "queued" || item.status === "confirm" || item.status === "transferring",
       ),
     );
   }, []);
@@ -534,10 +648,88 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
         </Pressable>
       ) : null}
 
+      <Text style={styles.label}>Download a file from this host</Text>
+      <View style={styles.inputRow}>
+        <TextInput
+          style={styles.input}
+          value={downloadPath}
+          onChangeText={setDownloadPath}
+          placeholder="/absolute/path or ~/path"
+          placeholderTextColor={theme.colors.foregroundMuted}
+          autoCapitalize="none"
+          autoCorrect={false}
+        />
+        <Pressable accessibilityRole="button" onPress={toggleDlBrowse} style={styles.button}>
+          <Text style={styles.buttonText}>{dlBrowseOpen ? "Close" : "Browse files"}</Text>
+        </Pressable>
+        <Pressable accessibilityRole="button" onPress={startDownload} style={styles.buttonAccent}>
+          <Text style={styles.buttonAccentText}>Download</Text>
+        </Pressable>
+      </View>
+
+      {dlBrowseOpen ? (
+        <View style={styles.browseBox}>
+          <Text style={styles.browsePath}>{dlBrowse ? dlBrowse.path : "Loading…"}</Text>
+          {dlBrowseError ? <Text style={styles.errorText}>{dlBrowseError}</Text> : null}
+          {dlBrowse ? (
+            <ScrollView>
+              {dlBrowse.parent ? (
+                <Pressable
+                  accessibilityRole="button"
+                  onPress={() => void dlBrowseTo(dlBrowse.parent ?? undefined)}
+                  style={styles.browseRow}
+                >
+                  <Icon name="ArrowUp" size={14} color={theme.colors.foregroundMuted} />
+                  <Text style={styles.browseRowText}>..</Text>
+                </Pressable>
+              ) : null}
+              {dlBrowse.entries.map((entry) => (
+                <Pressable
+                  key={entry.path}
+                  accessibilityRole="button"
+                  accessibilityLabel={
+                    entry.isDir ? `Open folder ${entry.name}` : `Download ${entry.name}`
+                  }
+                  onPress={() =>
+                    entry.isDir ? void dlBrowseTo(entry.path) : enqueueDownload(entry.path)
+                  }
+                  style={styles.browseRow}
+                >
+                  <Icon
+                    name={entry.isDir ? "Folder" : "File"}
+                    size={14}
+                    color={theme.colors.foregroundMuted}
+                  />
+                  <Text style={styles.browseRowText} numberOfLines={1}>
+                    {entry.name}
+                  </Text>
+                  {entry.isDir ? null : (
+                    <Text style={styles.itemMeta}>
+                      {entry.size !== undefined ? formatBytes(entry.size) : ""}
+                    </Text>
+                  )}
+                  {entry.isDir ? null : (
+                    <Icon name="Download" size={13} color={theme.colors.accent} />
+                  )}
+                </Pressable>
+              ))}
+              {dlBrowse.entries.length === 0 ? (
+                <Text style={styles.browsePath}>Empty directory</Text>
+              ) : null}
+              {dlBrowse.truncated ? (
+                <Text style={styles.browsePath}>
+                  …and {Math.max(0, dlBrowse.total - dlBrowse.entries.length)} more
+                </Text>
+              ) : null}
+            </ScrollView>
+          ) : null}
+        </View>
+      ) : null}
+
       {items.length > 0 ? (
         <View>
           <View style={styles.sectionRow}>
-            <Text style={styles.label}>Uploads</Text>
+            <Text style={styles.label}>Transfers</Text>
             <Pressable accessibilityRole="button" onPress={clearFinished}>
               <Text style={styles.label}>Clear finished</Text>
             </Pressable>
@@ -563,15 +755,17 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
           ) : null}
           <ScrollView style={{ maxHeight: layout.compact ? 160 : 200 }}>
             {items.map((item) => {
-              const percent = item.size > 0 ? Math.round((item.sent / item.size) * 100) : 100;
+              const percent = item.size > 0 ? Math.round((item.sent / item.size) * 100) : 0;
               const icon =
                 item.status === "done"
                   ? "CircleCheckBig"
                   : item.status === "error"
                     ? "CircleAlert"
-                    : item.status === "uploading"
+                    : item.status === "transferring"
                       ? "LoaderCircle"
-                      : "Clock";
+                      : item.direction === "down"
+                        ? "Download"
+                        : "Clock";
               const iconColor =
                 item.status === "done"
                   ? theme.colors.statusSuccess
@@ -613,7 +807,9 @@ export function FileDropPanel({ theme, layout, workspaceId }: PluginWorkspacePan
                           ? formatBytes(item.size)
                           : item.status === "error"
                             ? "failed"
-                            : `${percent}%`}
+                            : item.status === "queued"
+                              ? "queued"
+                              : `${percent}%`}
                       </Text>
                     </View>
                   )}
