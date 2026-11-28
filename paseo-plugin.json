@@ -4,7 +4,8 @@
   "description": "Drag-drop file upload from the browser into a directory on this host",
   "media": [
     "media/explorer-panel.png",
-    "media/explorer-menu.png"
+    "media/explorer-menu.png",
+    "media/download-panel.png"
   ],
   "requirements": {
     "paseo": ">=0.17.0"
